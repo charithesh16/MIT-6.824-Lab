@@ -8,6 +8,7 @@ package raft
 
 import (
 	//	"bytes"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -54,6 +55,9 @@ type Raft struct {
 	state         int // 0: follower, 1: candidate, 2: leader
 	nextIndex     []int
 	matchIndex    []int
+
+	cond    *sync.Cond
+	applyCh chan raftapi.ApplyMsg
 }
 
 type Entry struct {
@@ -248,6 +252,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.state != LEADER || rf.killed() {
+		return index, term, false
+	}
+	index = len(rf.log)
+	term = rf.currentTerm
+	isLeader = true
+	rf.log = append(rf.log, Entry{Term: term, Command: command})
+
 	// Your code here (3B).
 
 	return index, term, isLeader
@@ -323,7 +338,41 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	// TODO: handle entries later
+	i := 0
+	j := args.PrevLogIndex + 1
+	DPrintf("%d", j)
+	for i = 0; i < len(args.Entries); i++ {
+		if j >= len(rf.log) {
+			break
+		}
+		if rf.log[j].Term == args.Entries[i].Term {
+			j++
+		} else {
+			rf.log = append(rf.log[:j], args.Entries[i:]...)
+			i = len(args.Entries)
+			j = len(rf.log) - 1
+			break
+		}
+	}
+	if i < len(args.Entries) {
+		rf.log = append(rf.log, args.Entries[i:]...)
+		j = len(rf.log) - 1
+	} else {
+		j--
+	}
+	// DPrintLog(rf)
+	reply.Success = true
+
+	if args.LeaderCommit > rf.commitIndex {
+		// set commitIndex = min(leaderCommit, index of last **new** entry)
+		oriCommitIndex := rf.commitIndex
+		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(j)))
+		DPrintf("[term %d]:Raft [%d] [state %d] commitIndex is %d", rf.currentTerm, rf.me, rf.state, rf.commitIndex)
+		if rf.commitIndex > oriCommitIndex {
+			// wake up sleeping applyCommit Go routine
+			rf.cond.Broadcast()
+		}
+	}
 	return
 }
 
@@ -336,7 +385,7 @@ func (rf *Raft) callAppendEntries(peer int, term int, leaderId int, prevLogIndex
 	DPrintf("[term %d]:Raft [%d] [state %d] sends appendentries RPC to server[%d]\n", rf.currentTerm, rf.me, rf.state, peer)
 	args := AppendEntriesArgs{
 		Term:         term,
-		LeaderId:     rf.me,
+		LeaderId:     leaderId,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
 		Entries:      entries,
@@ -389,6 +438,9 @@ func (rf *Raft) sendLeaderHeartBeats() {
 			}
 			// send heartbeat
 			go func(peer int) {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
 				go rf.callAppendEntries(peer, term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommitIndex)
 			}(peer)
 		}
@@ -428,6 +480,58 @@ func (rf *Raft) callRequestVote(server int, term int, lastlogidx int, lastlogter
 	return reply.VoteGranted
 }
 
+func (rf *Raft) allocateAppendCheckers() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go rf.appendChecker(i)
+	}
+}
+
+// periodically check if last log index >= nextIndex[server], if so, send AppendEntries (leader only)
+func (rf *Raft) appendChecker(server int) {
+	for {
+		rf.mu.Lock()
+		if rf.killed() || rf.state != LEADER {
+			rf.mu.Unlock()
+			return
+		}
+		lastlogidx := len(rf.log) - 1
+		nextidx := rf.nextIndex[server]
+		term := rf.currentTerm
+		preLogIndex := nextidx - 1
+		preLogTerm := rf.log[preLogIndex].Term
+		leaderCommit := rf.commitIndex
+		entries := rf.log[nextidx:]
+		rf.mu.Unlock()
+		if lastlogidx >= nextidx {
+			DPrintf("[term %d]: Raft[%d] send real appendEntries to Raft[%d]", rf.currentTerm, rf.me, server)
+			success := rf.callAppendEntries(server, term, rf.me, preLogIndex, preLogTerm, entries, leaderCommit)
+
+			rf.mu.Lock()
+			// term confusion
+			if term != rf.currentTerm {
+				rf.mu.Unlock()
+				continue
+			}
+			// append entries successfully, update nextIndex and matchIndex
+			if success {
+				rf.nextIndex[server] = nextidx + len(entries)
+				rf.matchIndex[server] = preLogIndex + len(entries)
+				DPrintf("[term %d]: Raft[%d] successfully append entries to Raft[%d]", rf.currentTerm, rf.me, server)
+			} else {
+				// if AppendEntries fails because of log inconsistency: decrement nextIndex and retry
+				rf.nextIndex[server] = int(math.Max(1.0, float64(rf.nextIndex[server]-1)))
+				rf.mu.Unlock()
+				continue
+			}
+			rf.mu.Unlock()
+		}
+		time.Sleep(time.Millisecond * time.Duration(CHECKAPPENDPERIOED))
+	}
+}
+
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.currentTerm++
@@ -460,12 +564,69 @@ func (rf *Raft) startElection() {
 					electionFinished = true
 					rf.mu.Lock()
 					rf.state = LEADER
+					for i := 0; i < len(rf.peers); i++ {
+						rf.nextIndex[i] = len(rf.log) // rf.log indexed from 1
+						rf.matchIndex[i] = 0
+					}
 					rf.mu.Unlock()
 					go rf.sendLeaderHeartBeats()
+					go rf.allocateAppendCheckers()
+					go rf.commitChecker()
 				}
 			}
 			voteMutex.Unlock()
 		}(peer)
+	}
+}
+
+// periodically check if there exists a log entry which is commited
+func (rf *Raft) commitChecker() {
+	for {
+		consensus := 1
+		rf.mu.Lock()
+		if rf.commitIndex < len(rf.log)-1 {
+			N := rf.commitIndex + 1
+			for i := 0; i < len(rf.peers); i++ {
+				if i == rf.me {
+					continue
+				}
+				if rf.matchIndex[i] >= N {
+					consensus++
+				}
+			}
+			if consensus*2 > len(rf.peers) && rf.log[N].Term == rf.currentTerm {
+				DPrintf("[term %d]:Raft [%d] [state %d] commit log entry %d successfully", rf.currentTerm, rf.me, rf.state, N)
+				rf.commitIndex = N
+				// kick the applyCommit go routine
+				rf.cond.Broadcast()
+			}
+		}
+		rf.mu.Unlock()
+		time.Sleep(time.Millisecond * time.Duration(CHECKCOMMITPERIOED))
+	}
+}
+
+func (rf *Raft) applyCommited() {
+	for {
+		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex {
+			rf.cond.Wait()
+		}
+		rf.lastApplied++
+		DPrintf("[term %d]:Raft [%d] [state %d] apply log entry %d to the service", rf.currentTerm, rf.me, rf.state, rf.lastApplied)
+		DPrintf("[log]: %v", rf.log)
+		cmtidx := rf.lastApplied
+		command := rf.log[cmtidx].Command
+		rf.mu.Unlock()
+		// commit the log entry
+		msg := raftapi.ApplyMsg{
+			CommandValid: true,
+			Command:      command,
+			CommandIndex: cmtidx,
+		}
+		// this line may be blocked
+		rf.applyCh <- msg
+		DPrintf("[term %d]:Raft [%d] [state %d] apply log entry %d to the service successfully", rf.currentTerm, rf.me, rf.state, rf.lastApplied)
 	}
 }
 
@@ -496,12 +657,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastHeartbeat = time.Now()
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
+	rf.cond = sync.NewCond(&rf.mu)
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applyCommited()
 
 	return rf
 }
