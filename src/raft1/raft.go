@@ -20,7 +20,7 @@ import (
 	tester "6.5840/tester1"
 )
 
-const HEATBEAT float64 = 150   // leader send heatbit per 150ms
+const HEATBEAT float64 = 50    // leader send heatbit per 50ms (reduced from 150ms for faster log replication)
 const TIMEOUTLOW float64 = 500 // the timeout period randomize between 500ms - 1000ms
 const TIMEOUTHIGH float64 = 1000
 const CHECKPERIOD float64 = 300       // check timeout per 300ms
@@ -338,35 +338,45 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	i := 0
-	j := args.PrevLogIndex + 1
-	DPrintf("%d", j)
-	for i = 0; i < len(args.Entries); i++ {
-		if j >= len(rf.log) {
-			break
-		}
-		if rf.log[j].Term == args.Entries[i].Term {
-			j++
-		} else {
-			rf.log = append(rf.log[:j], args.Entries[i:]...)
-			i = len(args.Entries)
-			j = len(rf.log) - 1
-			break
-		}
-	}
-	if i < len(args.Entries) {
-		rf.log = append(rf.log, args.Entries[i:]...)
-		j = len(rf.log) - 1
-	} else {
-		j--
-	}
-	// DPrintLog(rf)
-	reply.Success = true
 
+	// Handle log entries according to Raft paper specification
+	// If there are entries to append
+	if len(args.Entries) > 0 {
+		// Find first conflicting entry (if any)
+		conflictIndex := -1
+		for i, entry := range args.Entries {
+			logIndex := args.PrevLogIndex + 1 + i
+			if logIndex >= len(rf.log) {
+				// No more entries in our log, append remaining
+				break
+			}
+			if rf.log[logIndex].Term != entry.Term {
+				// Found conflict, truncate log from this point
+				conflictIndex = logIndex
+				break
+			}
+		}
+
+		// If we found a conflict, truncate the log
+		if conflictIndex != -1 {
+			rf.log = rf.log[:conflictIndex]
+		}
+
+		// Append new entries that aren't already in the log
+		for i, entry := range args.Entries {
+			logIndex := args.PrevLogIndex + 1 + i
+			if logIndex >= len(rf.log) {
+				rf.log = append(rf.log, entry)
+			}
+		}
+	}
+
+	// Update commit index if leader's commit index is higher
 	if args.LeaderCommit > rf.commitIndex {
-		// set commitIndex = min(leaderCommit, index of last **new** entry)
+		// set commitIndex = min(leaderCommit, index of last new entry)
 		oriCommitIndex := rf.commitIndex
-		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(j)))
+		lastNewIndex := len(rf.log) - 1
+		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(lastNewIndex)))
 		DPrintf("[term %d]:Raft [%d] [state %d] commitIndex is %d", rf.currentTerm, rf.me, rf.state, rf.commitIndex)
 		if rf.commitIndex > oriCommitIndex {
 			// wake up sleeping applyCommit Go routine
@@ -423,7 +433,7 @@ func (rf *Raft) sendLeaderHeartBeats() {
 			rf.mu.Unlock()
 			return
 		}
-		// else send heartbeats  to all peers.
+		// else send heartbeats to all peers.
 		term := rf.currentTerm
 		leaderId := rf.me
 		prevLogIndex := len(rf.log) - 1
@@ -437,47 +447,10 @@ func (rf *Raft) sendLeaderHeartBeats() {
 				continue
 			}
 			// send heartbeat
-			go func(peer int) {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-
-				go rf.callAppendEntries(peer, term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommitIndex)
-			}(peer)
+			go rf.callAppendEntries(peer, term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommitIndex)
 		}
 		time.Sleep(time.Millisecond * time.Duration(HEATBEAT))
 	}
-}
-
-func (rf *Raft) callRequestVote(server int, term int, lastlogidx int, lastlogterm int) bool {
-	DPrintf("[term %d]:Raft [%d][state %d] sends requestvote RPC to server[%d]\n", term, rf.me, rf.state, server)
-	args := RequestVoteArgs{
-		Term:         term,
-		CandidateId:  rf.me,
-		LastLogIndex: lastlogidx,
-		LastLogTerm:  lastlogterm,
-	}
-	reply := RequestVoteReply{}
-	ok := rf.sendRequestVote(server, &args, &reply)
-	if !ok {
-		return false
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// *** to avoid term confusion !!! ***
-	// compare the current term with the term you sent in your original RPC.
-	// If the two are different, drop the reply and return
-	if term != rf.currentTerm {
-		return false
-	}
-
-	// other server has higher term !
-	if reply.Term > rf.currentTerm {
-		rf.currentTerm = reply.Term
-		rf.state = FOLLOWER
-		rf.votedFor = -1
-	}
-	return reply.VoteGranted
 }
 
 func (rf *Raft) allocateAppendCheckers() {
@@ -532,6 +505,38 @@ func (rf *Raft) appendChecker(server int) {
 	}
 }
 
+func (rf *Raft) callRequestVote(server int, term int, lastlogidx int, lastlogterm int) bool {
+	DPrintf("[term %d]:Raft [%d][state %d] sends requestvote RPC to server[%d]\n", term, rf.me, rf.state, server)
+	args := RequestVoteArgs{
+		Term:         term,
+		CandidateId:  rf.me,
+		LastLogIndex: lastlogidx,
+		LastLogTerm:  lastlogterm,
+	}
+	reply := RequestVoteReply{}
+	ok := rf.sendRequestVote(server, &args, &reply)
+	if !ok {
+		return false
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// *** to avoid term confusion !!! ***
+	// compare the current term with the term you sent in your original RPC.
+	// If the two are different, drop the reply and return
+	if term != rf.currentTerm {
+		return false
+	}
+
+	// other server has higher term !
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.state = FOLLOWER
+		rf.votedFor = -1
+	}
+	return reply.VoteGranted
+}
+
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.currentTerm++
@@ -584,6 +589,11 @@ func (rf *Raft) commitChecker() {
 	for {
 		consensus := 1
 		rf.mu.Lock()
+		// Exit if no longer a leader or killed
+		if rf.killed() || rf.state != LEADER {
+			rf.mu.Unlock()
+			return
+		}
 		if rf.commitIndex < len(rf.log)-1 {
 			N := rf.commitIndex + 1
 			for i := 0; i < len(rf.peers); i++ {
